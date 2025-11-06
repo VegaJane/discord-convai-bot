@@ -3,6 +3,18 @@ import { Client, GatewayIntentBits, Partials, SlashCommandBuilder, Routes } from
 import { REST } from "@discordjs/rest";
 import { joinVoiceChannel, createAudioPlayer, createAudioResource, NoSubscriberBehavior, AudioPlayerStatus } from "@discordjs/voice";
 
+// ---- Health server for Render ----
+import express from "express";
+const app = express();
+
+// Render provides a random PORT at runtime. Fall back to 10000 locally.
+const PORT = Number(process.env.PORT) || 10000;
+
+app.get("/", (_req, res) => res.send("ok"));
+app.get("/healthz", (_req, res) => res.send("ok"));
+app.listen(PORT, "0.0.0.0", () => console.log(`Health server on :${PORT}`));
+
+
 const { DISCORD_TOKEN, GUILD_ID } = process.env;
 if (!DISCORD_TOKEN || !GUILD_ID) { console.error("Set DISCORD_TOKEN & GUILD_ID"); process.exit(1); }
 
@@ -55,3 +67,4 @@ client.on("interactionCreate", async (i) => {
 });
 
 client.login(DISCORD_TOKEN);
+
