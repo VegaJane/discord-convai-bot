@@ -107,8 +107,9 @@ function ensureConnectionForInteraction(interaction) {
 /** Stream an MP3 (or WAV) from a URL and create an audio resource */
 async function getAudioResourceFor(_text) {
   // small public sample MP3; swap to your own URL any time
-  const url =
-    "https://file-examples.com/storage/fe2f2ae52e0f8a/sample3.mp3";
+  //const url =
+   // "https://file-examples.com/storage/fe2f2ae52e0f8a/sample3.mp3";
+  const url = "https://samplelib.com/lib/preview/mp3/sample-3s.mp3";
 
   const res = await fetch(url);
   if (!res.ok)
@@ -190,5 +191,6 @@ client.on(Events.InteractionCreate, async (i) => {
 
 /* --------------------------------- login ---------------------------------- */
 client.login(DISCORD_TOKEN);
+
 
 
