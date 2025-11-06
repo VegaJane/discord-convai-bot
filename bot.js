@@ -1,4 +1,4 @@
-// bot.js (ESM)
+// bot.js (stable build)
 
 import "dotenv/config";
 import express from "express";
@@ -19,19 +19,20 @@ import {
   AudioPlayerStatus,
   demuxProbe,
   getVoiceConnection,
+  VoiceConnectionStatus,
+  entersState,
 } from "@discordjs/voice";
 import fetch from "node-fetch";
 import { PassThrough } from "stream";
 
-/* ------------------------ health server for Render ------------------------ */
+/* ------------------------ Health server for Render ------------------------ */
 const app = express();
-// Render injects a random PORT value. Fall back to 10000 locally.
-const PORT = Number(process.env.PORT) || 10000;
+const PORT = Number(process.env.PORT) || 10000;         // MUST use Render's PORT
 app.get("/", (_req, res) => res.send("ok"));
 app.get("/healthz", (_req, res) => res.send("ok"));
 app.listen(PORT, "0.0.0.0", () => console.log(`Health server on :${PORT}`));
 
-/* --------------------------- env & basic wiring --------------------------- */
+/* --------------------------- Env & basic wiring --------------------------- */
 const { DISCORD_TOKEN, GUILD_ID, VOICE_CHANNEL_ID } = process.env;
 if (!DISCORD_TOKEN || !GUILD_ID) {
   console.error("Set DISCORD_TOKEN & GUILD_ID");
@@ -45,7 +46,7 @@ const client = new Client({
 
 const rest = new REST({ version: "10" }).setToken(DISCORD_TOKEN);
 
-/* -------------------------------- commands -------------------------------- */
+/* -------------------------------- Commands -------------------------------- */
 const commands = [
   new SlashCommandBuilder()
     .setName("join")
@@ -54,25 +55,19 @@ const commands = [
     .setName("say")
     .setDescription("Play a short test clip")
     .addStringOption((o) =>
-      o
-        .setName("text")
-        .setDescription("What to say (not used yet; test clip plays)")
-        .setRequired(true)
+      o.setName("text").setDescription("What to say (test clip plays)").setRequired(true)
     ),
 ].map((c) => c.toJSON());
 
 async function registerCommands() {
-  // ensure we have the application id
   await client.application?.fetch();
   const appId = client.application?.id;
   if (!appId) throw new Error("Could not resolve application id");
-  await rest.put(Routes.applicationGuildCommands(appId, GUILD_ID), {
-    body: commands,
-  });
+  await rest.put(Routes.applicationGuildCommands(appId, GUILD_ID), { body: commands });
   console.log("Slash commands registered.");
 }
 
-/* ------------------------------ voice player ------------------------------ */
+/* ------------------------------ Voice player ------------------------------ */
 const player = createAudioPlayer({
   behaviors: { noSubscriber: NoSubscriberBehavior.Pause },
 });
@@ -80,57 +75,69 @@ player.on("error", (e) => console.error("Audio player error:", e));
 player.on(AudioPlayerStatus.Playing, () => console.log("Audio: playing"));
 player.on(AudioPlayerStatus.Idle, () => console.log("Audio: idle"));
 
-function ensureConnectionForInteraction(interaction) {
-  // prefer the member's current channel; fallback to VOICE_CHANNEL_ID if provided
+/* Ensure connection is ready & subscribed every time */
+async function ensureConnectionForInteraction(interaction) {
   const memberVC =
     interaction?.member?.voice?.channel ??
-    (VOICE_CHANNEL_ID
-      ? interaction.guild.channels.cache.get(VOICE_CHANNEL_ID)
-      : null);
+    (VOICE_CHANNEL_ID ? interaction.guild.channels.cache.get(VOICE_CHANNEL_ID) : null);
 
   if (!memberVC) throw new Error("Join a voice channel first.");
 
-  const existing = getVoiceConnection(interaction.guild.id);
-  if (existing) return existing;
+  let conn = getVoiceConnection(interaction.guild.id);
+  if (!conn) {
+    conn = joinVoiceChannel({
+      channelId: memberVC.id,
+      guildId: memberVC.guild.id,
+      adapterCreator: memberVC.guild.voiceAdapterCreator,
+      selfDeaf: true,   // OK for output-only
+      selfMute: false,
+    });
+  }
 
-  const conn = joinVoiceChannel({
-    channelId: memberVC.id,
-    guildId: memberVC.guild.id,
-    adapterCreator: memberVC.guild.voiceAdapterCreator,
-    selfDeaf: true,
-    selfMute: false,
-  });
+  // Wait until Discord says the connection is fully ready
+  await entersState(conn, VoiceConnectionStatus.Ready, 10_000);
+
+  // Always (re)subscribe to avoid silent playback on reused connections
   conn.subscribe(player);
   return conn;
 }
 
-/** Stream an MP3 (or WAV) from a URL and create an audio resource */
+/* Stream small OGG (preferred) with MP3 fallback, explicit volume */
 async function getAudioResourceFor(_text) {
-  // small public sample MP3; swap to your own URL any time
-  //const url =
-   // "https://file-examples.com/storage/fe2f2ae52e0f8a/sample3.mp3";
-  const url = "https://samplelib.com/lib/preview/mp3/sample-3s.mp3";
+  const urls = [
+    "https://upload.wikimedia.org/wikipedia/commons/c/c8/Example.ogg", // tiny OGG
+    "https://samplelib.com/lib/preview/mp3/sample-3s.mp3",             // fallback MP3
+  ];
 
-  const res = await fetch(url);
-  if (!res.ok)
-    throw new Error(`Audio fetch failed: ${res.status} ${res.statusText}`);
+  for (const url of urls) {
+    try {
+      const res = await fetch(url);
+      if (!res.ok) continue;
 
-  const stream = new PassThrough();
-  res.body.pipe(stream);
+      const stream = new PassThrough();
+      res.body.pipe(stream);
 
-  // probe stream so the voice lib knows the input type
-  const probe = await demuxProbe(stream);
-  return createAudioResource(probe.stream, { inputType: probe.type });
+      const probe = await demuxProbe(stream);
+      const resource = createAudioResource(probe.stream, {
+        inputType: probe.type,
+        inlineVolume: true,
+      });
+      resource.volume?.setVolume(1.1);
+      return resource;
+    } catch (e) {
+      // try next url
+    }
+  }
+  throw new Error("Audio fetch failed for all sources.");
 }
 
-/* --------------------------------- events --------------------------------- */
+/* --------------------------------- Events --------------------------------- */
 client.once(Events.ClientReady, async () => {
   try {
     await registerCommands();
     console.log(`Logged in as ${client.user.tag}`);
   } catch (e) {
     console.error("Command registration failed:", e);
-    // non-fatal — bot can still run, but commands might not appear yet
   }
 });
 
@@ -140,30 +147,22 @@ client.on(Events.InteractionCreate, async (i) => {
   try {
     switch (i.commandName) {
       case "join": {
-        ensureConnectionForInteraction(i);
+        await ensureConnectionForInteraction(i);
         await i.reply({ content: "Joined ✅", ephemeral: true });
         break;
       }
 
       case "say": {
-        ensureConnectionForInteraction(i);
+        await ensureConnectionForInteraction(i);
         await i.deferReply({ ephemeral: true });
 
-        const resource = await getAudioResourceFor(
-          i.options.getString("text", true)
-        );
+        const resource = await getAudioResourceFor(i.options.getString("text", true));
         player.play(resource);
 
-        // wait until the player actually starts
+        // Wait until audio actually starts before confirming
         await new Promise((resolve, reject) => {
-          const onPlay = () => {
-            cleanup();
-            resolve();
-          };
-          const onErr = (err) => {
-            cleanup();
-            reject(err);
-          };
+          const onPlay = () => { cleanup(); resolve(); };
+          const onErr = (err) => { cleanup(); reject(err); };
           function cleanup() {
             player.off(AudioPlayerStatus.Playing, onPlay);
             player.off("error", onErr);
@@ -181,16 +180,9 @@ client.on(Events.InteractionCreate, async (i) => {
     }
   } catch (e) {
     console.error(e);
-    try {
-      await i.reply({ content: `Error: ${e.message}`, ephemeral: true });
-    } catch {
-      // ignore reply errors (e.g., already replied)
-    }
+    try { await i.reply({ content: `Error: ${e.message}`, ephemeral: true }); } catch {}
   }
 });
 
-/* --------------------------------- login ---------------------------------- */
+/* --------------------------------- Login ---------------------------------- */
 client.login(DISCORD_TOKEN);
-
-
-
